@@ -1,0 +1,529 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ant Farm Simulation</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+        canvas { display: block; }
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(255, 255, 255, 0.8);
+            padding: 10px;
+            border-radius: 5px;
+        }
+        #controls label { margin-right: 5px; }
+        #controls input { width: 60px; margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <canvas id="antfarm"></canvas>
+    <div id="controls">
+        <div><label>Ants:</label><input type="number" id="numAnts" value="12" min="1" max="100"></div>
+        <div><label>Pheromone:</label><input type="number" id="pheromoneStrength" value="1" min="0.1" max="10" step="0.1"></div>
+        <div><label>Evaporation:</label><input type="number" id="evaporationRate" value="0.95" min="0.9" max="1" step="0.01"></div>
+        <button onclick="restart()">Restart</button>
+    </div>
+    <script>
+        // Constants
+        const CELL_SIZE = 3;
+        const GRID_WIDTH = Math.floor(window.innerWidth / CELL_SIZE);
+        const GRID_HEIGHT = Math.floor(window.innerHeight / CELL_SIZE);
+        const NEST_ROW = GRID_HEIGHT - 1;
+        const NEST_COL = Math.floor(GRID_WIDTH / 2);
+        let FOOD_POSITIONS = [];
+        let NUM_ANTS = 12;
+        let DEPOSIT_AMOUNT = 1;
+        let EVAPORATION_FACTOR = 0.95;
+        const EPSILON = 0.01;
+        const K = 0.1;
+        const R = 18;
+        const C = 1;
+        const SIMULATION_INTERVAL = 2; // Reduced for smoother updates
+        const HISTORY_SIZE = 10;
+        const RANDOM_MOVE_PROB = 0.35;
+        const SHARE_RADIUS = 8;
+        const VISIT_THRESHOLD = 5;
+        const EXPLORATION_BONUS = 1.0;
+        const MOMENTUM_STEPS = 5;
+        const FOOD_WIDTH = 3;
+        const FOOD_HEIGHT = 4;
+        const FOOD_PIECES = 12;
+        const TRANSITION_SPEED = 0.5; // Speed of interpolation between grid cells
+
+        // Initialize grids
+        let grid = Array(GRID_HEIGHT).fill().map(() => Array(GRID_WIDTH).fill(0));
+        let foodPheromones = Array(GRID_HEIGHT).fill().map(() => Array(GRID_WIDTH).fill(0));
+        let nestPheromones = Array(GRID_HEIGHT).fill().map(() => Array(GRID_WIDTH).fill(0));
+        let visitedCells = Array(GRID_HEIGHT).fill().map(() => Array(GRID_WIDTH).fill(false));
+
+        // Set top row to grass
+        for (let j = 0; j < GRID_WIDTH; j++) {
+            grid[0][j] = 2;
+        }
+
+        // Set nest area
+        for (let i = NEST_ROW - 1; i <= NEST_ROW + 1; i++) {
+            for (let j = NEST_COL - 1; j <= NEST_COL + 1; j++) {
+                if (i >= 0 && i < GRID_HEIGHT && j >= 0 && j < GRID_WIDTH) {
+                    grid[i][j] = 1;
+                    nestPheromones[i][j] = 5;
+                    visitedCells[i][j] = true;
+                }
+            }
+        }
+
+        // Initialize ants
+        let ants = [];
+        function initializeAnts() {
+            ants = [];
+            for (let k = 0; k < NUM_ANTS; k++) {
+                ants.push({
+                    row: NEST_ROW,
+                    col: NEST_COL,
+                    renderRow: NEST_ROW, // For smooth rendering
+                    renderCol: NEST_COL, // For smooth rendering
+                    targetRow: NEST_ROW, // Target grid position
+                    targetCol: NEST_COL, // Target grid position
+                    state: 'searching',
+                    direction: ['up', 'down', 'left', 'right'][Math.floor(Math.random() * 4)],
+                    path: null,
+                    history: [],
+                    visitMap: new Map(),
+                    knownFoodLocations: [],
+                    memory: new Set(),
+                    momentum: 0
+                });
+            }
+        }
+        initializeAnts();
+
+        // Canvas setup
+        const canvas = document.getElementById('antfarm');
+        const ctx = canvas.getContext('2d');
+        canvas.width = GRID_WIDTH * CELL_SIZE;
+        canvas.height = GRID_HEIGHT * CELL_SIZE;
+
+        // ImageData for optimized rendering
+        const imageData = ctx.createImageData(canvas.width, canvas.height);
+        const data = imageData.data;
+
+        // Control inputs
+        const numAntsInput = document.getElementById('numAnts');
+        const pheromoneStrengthInput = document.getElementById('pheromoneStrength');
+        const evaporationRateInput = document.getElementById('evaporationRate');
+
+        // Click handling for food placement
+        canvas.addEventListener('click', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            const row = Math.floor(y / CELL_SIZE);
+            const col = Math.floor(x / CELL_SIZE);
+            if (row >= 0 && row < GRID_HEIGHT && col >= 0 && col < GRID_WIDTH && grid[row][col] !== 2) {
+                const startRow = Math.max(1, Math.min(row - Math.floor(FOOD_HEIGHT / 2), GRID_HEIGHT - FOOD_HEIGHT));
+                const startCol = Math.max(0, Math.min(col - Math.floor(FOOD_WIDTH / 2), GRID_WIDTH - FOOD_WIDTH));
+                FOOD_POSITIONS.push({
+                    row: startRow,
+                    col: startCol,
+                    width: FOOD_WIDTH,
+                    height: FOOD_HEIGHT,
+                    remaining: FOOD_PIECES
+                });
+                const centerRow = startRow + Math.floor(FOOD_HEIGHT / 2);
+                const centerCol = startCol + Math.floor(FOOD_WIDTH / 2);
+                foodPheromones[centerRow][centerCol] += 10;
+            }
+        });
+
+        // Helper functions
+        function getAdjacent(row, col, condition) {
+            let adj = [];
+            if (row > 0 && condition(grid[row - 1][col])) adj.push({ r: row - 1, c: col });
+            if (row < GRID_HEIGHT - 1 && condition(grid[row + 1][col])) adj.push({ r: row + 1, c: col });
+            if (col > 0 && condition(grid[row][col - 1])) adj.push({ r: row, c: col - 1 });
+            if (col < GRID_WIDTH - 1 && condition(grid[row][col + 1])) adj.push({ r: row, c: col + 1 });
+            return adj;
+        }
+
+        function weightedRandom(weights) {
+            let total = weights.reduce((a, b) => a + b, 0);
+            let rand = Math.random() * total;
+            let cumulative = 0;
+            for (let i = 0; i < weights.length; i++) {
+                cumulative += weights[i];
+                if (rand < cumulative) return i;
+            }
+            return weights.length - 1;
+        }
+
+        function manhattanDistance(r1, c1, r2, c2) {
+            return Math.abs(r1 - r2) + Math.abs(c1 - c2);
+        }
+
+        // Enhanced A* pathfinding with pheromone influence
+        function findPath(startRow, startCol, endRow, endCol, pheromoneGrid) {
+            const openSet = [{
+                r: startRow,
+                c: startCol,
+                g: 0,
+                h: manhattanDistance(startRow, startCol, endRow, endCol),
+                f: 0,
+                parent: null
+            }];
+            const closedSet = new Set();
+            while (openSet.length > 0) {
+                openSet.sort((a, b) => a.f - b.f);
+                const current = openSet.shift();
+                if (current.r === endRow && current.c === endCol) {
+                    const path = [];
+                    let node = current;
+                    while (node) {
+                        path.unshift({ r: node.r, c: node.c });
+                        node = node.parent;
+                    }
+                    return path.slice(1);
+                }
+                closedSet.add(`${current.r},${current.c}`);
+                const neighbors = getAdjacent(current.r, current.c, x => x === 1);
+                for (const neighbor of neighbors) {
+                    const key = `${neighbor.r},${neighbor.c}`;
+                    if (closedSet.has(key)) continue;
+                    const tentativeG = current.g + 1;
+                    const pheromoneBoost = pheromoneGrid[neighbor.r][neighbor.c] * 0.2;
+                    const h = manhattanDistance(neighbor.r, neighbor.c, endRow, endCol);
+                    const f = tentativeG + h - pheromoneBoost;
+                    let inOpen = openSet.find(n => n.r === neighbor.r && n.c === neighbor.c);
+                    if (!inOpen) {
+                        inOpen = { r: neighbor.r, c: neighbor.c, g: tentativeG, h, f, parent: current };
+                        openSet.push(inOpen);
+                    } else if (tentativeG < inOpen.g) {
+                        inOpen.g = tentativeG;
+                        inOpen.f = tentativeG + inOpen.h - pheromoneBoost;
+                        inOpen.parent = current;
+                    }
+                }
+            }
+            return [];
+        }
+
+        // Check if a position is within a food pile's grid
+        function isWithinFoodPile(row, col, food) {
+            return row >= food.row && row < food.row + food.height &&
+                   col >= food.col && col < food.col + food.width;
+        }
+
+        // Simulation step
+        function simulationStep() {
+            DEPOSIT_AMOUNT = parseFloat(pheromoneStrengthInput.value);
+            EVAPORATION_FACTOR = parseFloat(evaporationRateInput.value);
+
+            ants.forEach(ant => {
+                const { row, col, state } = ant;
+                if (state === 'searching') {
+                    const adjacent = getAdjacent(row, col, x => x !== 2);
+                    if (adjacent.length > 0) {
+                        const nearbyFoods = FOOD_POSITIONS.filter(food => {
+                            const centerRow = food.row + Math.floor(food.height / 2);
+                            const centerCol = food.col + Math.floor(food.width / 2);
+                            return manhattanDistance(row, col, centerRow, centerCol) <= R;
+                        });
+                        let targetFood = null;
+                        if (nearbyFoods.length > 0) {
+                            targetFood = nearbyFoods.reduce((a, b) => {
+                                const aCenterRow = a.row + Math.floor(a.height / 2);
+                                const aCenterCol = a.col + Math.floor(a.width / 2);
+                                const bCenterRow = b.row + Math.floor(b.height / 2);
+                                const bCenterCol = b.col + Math.floor(b.width / 2);
+                                return manhattanDistance(row, col, aCenterRow, aCenterCol) < manhattanDistance(row, col, bCenterRow, bCenterCol) ? a : b;
+                            });
+                        } else if (ant.knownFoodLocations.length > 0) {
+                            targetFood = ant.knownFoodLocations.reduce((a, b) => manhattanDistance(row, col, a.row, a.col) < manhattanDistance(row, col, b.row, b.col) ? a : b);
+                        }
+
+                        const weights = adjacent.map(cell => {
+                            const isTunnel = grid[cell.r][cell.c] === 1;
+                            let base = isTunnel ? foodPheromones[cell.r][cell.c] * 0.3 + EPSILON : K * EPSILON;
+                            if (targetFood) {
+                                const centerRow = targetFood.row + Math.floor(targetFood.height / 2);
+                                const centerCol = targetFood.col + Math.floor(targetFood.width / 2);
+                                const dist = manhattanDistance(cell.r, cell.c, centerRow, centerCol);
+                                base += C / (dist + 1);
+                            }
+                            const key = `${cell.r},${cell.c}`;
+                            const visitCount = ant.visitMap.get(key) || 0;
+                            if (visitCount >= VISIT_THRESHOLD) {
+                                base *= 0.3;
+                            }
+                            if (ant.memory.has(key)) {
+                                base *= 0.6;
+                            }
+                            const distFromNest = manhattanDistance(cell.r, cell.c, NEST_ROW, NEST_COL);
+                            const explorationFactor = EXPLORATION_BONUS * (1 + distFromNest / 30);
+                            if (!visitedCells[cell.r][cell.c]) {
+                                base += explorationFactor;
+                            }
+                            if (cell.r < row) {
+                                base += 0.2;
+                            }
+                            let directionBonus = 0.05;
+                            if (ant.momentum > 0 && (
+                                (cell.r - row === -1 && ant.direction === 'up') ||
+                                (cell.r - row === 1 && ant.direction === 'down') ||
+                                (cell.c - col === -1 && ant.direction === 'left') ||
+                                (cell.c - col === 1 && ant.direction === 'right')
+                            )) {
+                                directionBonus = 0.1;
+                            }
+                            if (cell.r - row === -1) base += directionBonus;
+                            else if (cell.r - row === 1) base += directionBonus;
+                            else if (cell.c - col === -1) base += directionBonus;
+                            else if (cell.c - col === 1) base += directionBonus;
+                            return base;
+                        });
+
+                        let chosenIndex;
+                        if (Math.random() < RANDOM_MOVE_PROB) {
+                            chosenIndex = Math.floor(Math.random() * adjacent.length);
+                            ant.momentum = 0;
+                        } else {
+                            chosenIndex = weightedRandom(weights);
+                            if (
+                                (adjacent[chosenIndex].r - row === -1 && ant.direction === 'up') ||
+                                (adjacent[chosenIndex].r - row === 1 && ant.direction === 'down') ||
+                                (adjacent[chosenIndex].c - col === -1 && ant.direction === 'left') ||
+                                (adjacent[chosenIndex].c - col === 1 && ant.direction === 'right')
+                            ) {
+                                ant.momentum = Math.min(ant.momentum + 1, MOMENTUM_STEPS);
+                            } else {
+                                ant.momentum = 0;
+                            }
+                        }
+                        const chosen = adjacent[chosenIndex];
+                        if (grid[chosen.r][chosen.c] === 0) {
+                            grid[chosen.r][chosen.c] = 1;
+                        }
+                        ant.row = chosen.r;
+                        ant.col = chosen.c;
+                        ant.targetRow = chosen.r;
+                        ant.targetCol = chosen.c;
+                        if (chosen.r < row) ant.direction = 'up';
+                        else if (chosen.r > row) ant.direction = 'down';
+                        else if (chosen.c < col) ant.direction = 'left';
+                        else if (chosen.c > col) ant.direction = 'right';
+                        const key = `${ant.row},${ant.col}`;
+                        ant.visitMap.set(key, (ant.visitMap.get(key) || 0) + 1);
+                        ant.memory.add(key);
+                        visitedCells[ant.row][ant.col] = true;
+                        ant.history.push({ r: ant.row, c: ant.col });
+                        if (ant.history.length > HISTORY_SIZE) ant.history.shift();
+
+                        const foodIndex = FOOD_POSITIONS.findIndex(food => isWithinFoodPile(chosen.r, chosen.c, food));
+                        if (foodIndex !== -1) {
+                            const food = FOOD_POSITIONS[foodIndex];
+                            if (food.remaining > 0) {
+                                food.remaining -= 1;
+                                ant.state = 'carrying';
+                                ant.path = findPath(chosen.r, chosen.c, NEST_ROW, NEST_COL, nestPheromones);
+                                const centerRow = food.row + Math.floor(food.height / 2);
+                                const centerCol = food.col + Math.floor(food.width / 2);
+                                foodPheromones[centerRow][centerCol] += DEPOSIT_AMOUNT * 2;
+                                ant.knownFoodLocations.push({ row: centerRow, col: centerCol });
+                                if (food.remaining <= 0) {
+                                    FOOD_POSITIONS.splice(foodIndex, 1);
+                                    ant.knownFoodLocations = ant.knownFoodLocations.filter(loc => loc.row !== centerRow || loc.col !== centerCol);
+                                }
+                            }
+                        }
+                    }
+                } else if (state === 'carrying') {
+                    if (ant.path && ant.path.length > 0) {
+                        const next = ant.path.shift();
+                        ant.row = next.r;
+                        ant.col = next.c;
+                        ant.targetRow = next.r;
+                        ant.targetCol = next.c;
+                        nestPheromones[next.r][next.c] += DEPOSIT_AMOUNT;
+                        visitedCells[next.r][next.c] = true;
+                        if (ant.row === NEST_ROW && ant.col === NEST_COL) {
+                            ant.state = 'searching';
+                            ant.path = null;
+                            ant.momentum = 0;
+                            ants.forEach(otherAnt => {
+                                if (otherAnt !== ant && manhattanDistance(otherAnt.row, otherAnt.col, NEST_ROW, NEST_COL) <= SHARE_RADIUS) {
+                                    ant.knownFoodLocations.forEach(foodLoc => {
+                                        if (!otherAnt.knownFoodLocations.some(loc => loc.row === foodLoc.row && loc.col === foodLoc.col)) {
+                                            otherAnt.knownFoodLocations.push({ ...foodLoc });
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    } else {
+                        ant.state = 'searching';
+                        ant.path = null;
+                        ant.momentum = 0;
+                    }
+                }
+
+                // Update render position for smooth movement
+                ant.renderRow += (ant.targetRow - ant.renderRow) * TRANSITION_SPEED;
+                ant.renderCol += (ant.targetCol - ant.renderCol) * TRANSITION_SPEED;
+            });
+
+            // Adaptive pheromone evaporation
+            for (let i = 0; i < GRID_HEIGHT; i++) {
+                for (let j = 0; j < GRID_WIDTH; j++) {
+                    const foodStrength = foodPheromones[i][j];
+                    const nestStrength = nestPheromones[i][j];
+                    const adaptiveEvap = EVAPORATION_FACTOR * (0.9 + 0.1 * Math.min(foodStrength / 10, 1));
+                    foodPheromones[i][j] *= adaptiveEvap;
+                    const adaptiveNestEvap = EVAPORATION_FACTOR * (0.9 + 0.1 * Math.min(nestStrength / 10, 1));
+                    nestPheromones[i][j] *= adaptiveNestEvap;
+                }
+            }
+        }
+
+        function draw() {
+            for (let i = 0; i < GRID_HEIGHT; i++) {
+                for (let j = 0; j < GRID_WIDTH; j++) {
+                    let color;
+                    const isFoodCell = FOOD_POSITIONS.some(food => isWithinFoodPile(i, j, food));
+                    if (isFoodCell) {
+                        color = [160, 32, 240, 255]; // Purple for food
+                    } else if (grid[i][j] === 2) {
+                        color = [0, 128, 0, 255]; // Green for grass
+                    } else if (i >= NEST_ROW - 1 && i <= NEST_ROW + 1 && j >= NEST_COL - 1 && j <= NEST_COL + 1) {
+                        color = [169, 169, 169, 255]; // Gray for nest
+                    } else if (grid[i][j] === 0) {
+                        color = visitedCells[i][j] ? [139, 69, 19, 255] : [139, 89, 19, 255]; // Brown shades for dirt
+                    } else {
+                        const foodIntensity = Math.min(1, foodPheromones[i][j] / 10);
+                        const nestIntensity = Math.min(1, nestPheromones[i][j] / 10);
+                        const r = 255 * foodIntensity;
+                        const b = 255 - nestIntensity * 200;
+                        color = [r, 255, b, 255]; // Pheromone-based coloring
+                    }
+                    setCellPixels(i, j, color);
+                }
+            }
+            ants.forEach(ant => {
+                const color = ant.state === 'searching' ? [255, 0, 0, 255] : [0, 0, 255, 255];
+                setAntPixels(ant.renderRow, ant.renderCol, color);
+            });
+            ctx.putImageData(imageData, 0, 0);
+        }
+
+        function setCellPixels(row, col, color) {
+            for (let dy = 0; dy < CELL_SIZE; dy++) {
+                for (let dx = 0; dx < CELL_SIZE; dx++) {
+                    const x = col * CELL_SIZE + dx;
+                    const y = row * CELL_SIZE + dy;
+                    if (x >= 0 && x < canvas.width && y >= 0 && y < canvas.height) {
+                        setPixel(x, y, color);
+                    }
+                }
+            }
+        }
+
+        function setAntPixels(renderRow, renderCol, color) {
+            const antSize = CELL_SIZE;
+            const startX = Math.round(renderCol * CELL_SIZE);
+            const startY = Math.round(renderRow * CELL_SIZE);
+            for (let dy = 0; dy < antSize; dy++) {
+                for (let dx = 0; dx < antSize; dx++) {
+                    const x = startX + dx;
+                    const y = startY + dy;
+                    if (x >= 0 && x < canvas.width && y >= 0 && y < canvas.height) {
+                        setPixel(x, y, color);
+                    }
+                }
+            }
+        }
+
+        function setPixel(x, y, color) {
+            const index = (y * canvas.width + x) * 4;
+            data[index] = color[0];
+            data[index + 1] = color[1];
+            data[index + 2] = color[2];
+            data[index + 3] = color[3];
+        }
+
+        function restart() {
+            NUM_ANTS = parseInt(numAntsInput.value);
+            FOOD_POSITIONS = [];
+            grid = Array(GRID_HEIGHT).fill().map(() => Array(GRID_WIDTH).fill(0));
+            foodPheromones = Array(GRID_HEIGHT).fill().map(() => Array(GRID_WIDTH).fill(0));
+            nestPheromones = Array(GRID_HEIGHT).fill().map(() => Array(GRID_WIDTH).fill(0));
+            visitedCells = Array(GRID_HEIGHT).fill().map(() => Array(GRID_WIDTH).fill(false));
+            for (let j = 0; j < GRID_WIDTH; j++) {
+                grid[0][j] = 2;
+            }
+            for (let i = NEST_ROW - 1; i <= NEST_ROW + 1; i++) {
+                for (let j = NEST_COL - 1; j <= NEST_COL + 1; j++) {
+                    if (i >= 0 && i < GRID_HEIGHT && j >= 0 && j < GRID_WIDTH) {
+                        grid[i][j] = 1;
+                        nestPheromones[i][j] = 5;
+                        visitedCells[i][j] = true;
+                    }
+                }
+            }
+            initializeAnts();
+        }
+
+        let frame = 0;
+        function loop() {
+            if (frame % SIMULATION_INTERVAL === 0) {
+                simulationStep();
+            }
+            draw();
+            frame++;
+            requestAnimationFrame(loop);
+        }
+
+        loop();
+    </script>
+</body>
+</html>
